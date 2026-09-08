@@ -1,2 +1,4 @@
-Flask==2.3.2
-aiohttp==3.9.1
+Flask>=2.0.0
+aiohttp>=3.8.0
+gunicorn>=20.0.0
+gevent>=21.0.0
