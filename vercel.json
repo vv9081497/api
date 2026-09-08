@@ -1,0 +1,14 @@
+{
+  "builds": [
+    {
+      "src": "Autoshopify.py",
+      "use": "@vercel/python"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/(.*)",
+      "dest": "Autoshopify.py"
+    }
+  ]
+}
