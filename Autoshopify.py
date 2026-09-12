@@ -522,8 +522,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             try:
                 resp_json = json.loads(resp_text)
             except json.JSONDecodeError as e:
-    snippet = resp_text[:200].replace('\n', ' ') if resp_text else 'Empty Response'
-    return False, f"Blocked/Invalid JSON: {snippet}", gateway, total_price, currency
+                return False, f"Invalid JSON response: {str(e)}", gateway, total_price, currency
 
             if 'errors' in resp_json:
                 errors = resp_json.get('errors', [])
