@@ -117,7 +117,7 @@ def parse_proxy(proxy_str):
 def is_captcha_required(response_text):
     if not response_text:
         return False
-    
+    # Coded by @aiojames
     indicators = [
         'CAPTCHA_REQUIRED',
         '"code":"CAPTCHA_REQUIRED"',
@@ -334,7 +334,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             attempt_token = attempt_token_match.group(1) if attempt_token_match else checkout_url.split('/')[-1].split('?')[0]
 
             sst = response.headers.get('X-Checkout-One-Session-Token') or response.headers.get('x-checkout-one-session-token')
-            
+            # Coded by @aiojames
             text = await response.text()
             if not sst:
                 sst = extract_between(text, 'name="serialized-sessionToken" content="&quot;', '&quot;')
@@ -676,6 +676,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 "payment_session_scope": urlparse(url).netloc
             }
             
+            # Coded by @aiojames
             vault_headers = {
                 'Content-Type': 'application/json',
                 'Accept': 'application/json',
@@ -1012,7 +1013,7 @@ async def process_card_async(cc, mes, ano, cvv, site_url, variant_id=None, proxy
     return await process_card(cc, mes, ano, cvv, site_url, variant_id, proxy_str)
 
 app = Flask(__name__)
-
+# Coded by @aiojames
 @app.route('/shopify', methods=['GET'])
 def shopify_checker():
     try:
@@ -1078,7 +1079,6 @@ def shopify_checker():
             "cc": request.args.get('cc', '')
         }), 500
 
+# Coded by @aiojames
 if __name__ == "__main__":
-    import os
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(host='0.0.0.0', port=5000, debug=False)
