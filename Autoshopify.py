@@ -28,11 +28,19 @@ except ImportError:
 
 
 # =====================================================================
-# RETRY CONFIG
+# RETRY / CLEANUP CONFIG
 # =====================================================================
 FETCH_RETRIES = int(os.getenv("FETCH_RETRIES", "3"))
 CART_RETRIES = int(os.getenv("CART_RETRIES", "3"))
 RETRY_BACKOFF = float(os.getenv("RETRY_BACKOFF", "0.5"))
+
+# Cache caps
+VARIANT_CACHE_MAX = int(os.getenv("VARIANT_CACHE_MAX", "5000"))       # max entries in memory
+VARIANT_CACHE_TTL = int(os.getenv("VARIANT_CACHE_TTL", "3600"))       # seconds
+CLEANUP_INTERVAL = int(os.getenv("CLEANUP_INTERVAL", "300"))          # every 5 min
+LOG_MAX_BYTES = int(os.getenv("LOG_MAX_BYTES", "5000000"))            # 5 MB per file
+LOG_BACKUPS = int(os.getenv("LOG_BACKUPS", "2"))                      # keep 2 old files
+LOG_MAX_AGE_DAYS = int(os.getenv("LOG_MAX_AGE_DAYS", "3"))            # delete logs older than N days
 
 
 # =====================================================================
@@ -51,7 +59,7 @@ QUERY_POLL = """query PollForReceipt($receiptId:ID!,$sessionToken:String!){recei
 
 
 # =====================================================================
-# LOGGING
+# LOGGING (with auto rotation + deletion by age)
 # =====================================================================
 LOG_DIR = os.getenv("LOG_DIR", "logs")
 LOG_JSON = os.getenv("LOG_JSON", "false").lower() in ("1", "true", "yes")
@@ -81,7 +89,12 @@ logger.handlers.clear()
 _formatter = _JsonFormatter() if LOG_JSON else logging.Formatter(
     "%(asctime)s [%(levelname)s] %(message)s"
 )
-_fh = RotatingFileHandler(os.path.join(LOG_DIR, "checker.log"), maxBytes=10_000_000, backupCount=3)
+# cap file size + keep only LOG_BACKUPS old files => auto rotation, no infinite growth
+_fh = RotatingFileHandler(
+    os.path.join(LOG_DIR, "checker.log"),
+    maxBytes=LOG_MAX_BYTES,
+    backupCount=LOG_BACKUPS,
+)
 _fh.setFormatter(_formatter)
 _ch = logging.StreamHandler(sys.stdout)
 _ch.setFormatter(_formatter)
@@ -89,11 +102,32 @@ logger.addHandler(_fh)
 logger.addHandler(_ch)
 
 
+def cleanup_old_logs():
+    """Delete rotated/old .log files older than LOG_MAX_AGE_DAYS."""
+    try:
+        now = time.time()
+        max_age = LOG_MAX_AGE_DAYS * 86400
+        for name in os.listdir(LOG_DIR):
+            if not name.endswith(".log") and ".log." not in name:
+                continue
+            path = os.path.join(LOG_DIR, name)
+            try:
+                if not os.path.isfile(path):
+                    continue
+                age = now - os.path.getmtime(path)
+                if age > max_age:
+                    os.remove(path)
+                    logger.info(f"cleanup: removed old log {name} (age={age/86400:.1f}d)")
+            except Exception as e:
+                logger.debug(f"cleanup: failed to remove {name}: {e}")
+    except Exception as e:
+        logger.debug(f"cleanup_old_logs error: {e}")
+
+
 # =====================================================================
-# VARIANT CACHE
+# VARIANT CACHE (with LRU eviction + TTL purge)
 # =====================================================================
 VARIANT_CACHE_FILE = os.getenv("VARIANT_CACHE_FILE", "variant_cache.json")
-_CACHE_TTL = int(os.getenv("VARIANT_CACHE_TTL", "3600"))
 _variant_cache = {}
 _cache_lock = threading.Lock()
 
@@ -103,7 +137,14 @@ def load_variant_cache():
     try:
         if os.path.exists(VARIANT_CACHE_FILE):
             with open(VARIANT_CACHE_FILE, "r") as f:
-                _variant_cache = json.load(f)
+                data = json.load(f)
+            if isinstance(data, dict):
+                # strip expired on load
+                now = time.time()
+                _variant_cache = {
+                    k: v for k, v in data.items()
+                    if isinstance(v, dict) and now - v.get("timestamp", 0) < VARIANT_CACHE_TTL
+                }
             logger.info(f"loaded {len(_variant_cache)} entries from variant cache")
     except Exception as e:
         logger.warning(f"failed to load variant cache: {e}")
@@ -113,8 +154,11 @@ def load_variant_cache():
 def save_variant_cache():
     try:
         with _cache_lock:
-            with open(VARIANT_CACHE_FILE, "w") as f:
-                json.dump(_variant_cache, f, indent=2)
+            snapshot = dict(_variant_cache)
+        tmp = VARIANT_CACHE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(snapshot, f)
+        os.replace(tmp, VARIANT_CACHE_FILE)
     except Exception as e:
         logger.warning(f"failed to save variant cache: {e}")
 
@@ -123,7 +167,7 @@ def get_cached_variant(domain):
     domain = domain.rstrip("/")
     with _cache_lock:
         entry = _variant_cache.get(domain)
-        if entry and time.time() - entry.get("timestamp", 0) < _CACHE_TTL:
+        if entry and time.time() - entry.get("timestamp", 0) < VARIANT_CACHE_TTL:
             return entry.get("variant_id"), entry.get("price"), entry.get("requires_shipping"), entry.get("handle")
     return None, None, None, None
 
@@ -131,6 +175,13 @@ def get_cached_variant(domain):
 def set_cached_variant(domain, variant_id, price, requires_shipping, handle=None):
     domain = domain.rstrip("/")
     with _cache_lock:
+        # evict oldest if over cap
+        if len(_variant_cache) >= VARIANT_CACHE_MAX and domain not in _variant_cache:
+            try:
+                oldest = min(_variant_cache.items(), key=lambda kv: kv[1].get("timestamp", 0))[0]
+                _variant_cache.pop(oldest, None)
+            except Exception:
+                pass
         _variant_cache[domain] = {
             "variant_id": variant_id,
             "price": price,
@@ -141,7 +192,43 @@ def set_cached_variant(domain, variant_id, price, requires_shipping, handle=None
     save_variant_cache()
 
 
+def purge_expired_cache():
+    """Remove expired entries from memory."""
+    now = time.time()
+    removed = 0
+    with _cache_lock:
+        for k in list(_variant_cache.keys()):
+            v = _variant_cache.get(k) or {}
+            if now - v.get("timestamp", 0) >= VARIANT_CACHE_TTL:
+                _variant_cache.pop(k, None)
+                removed += 1
+    if removed:
+        logger.info(f"cache purge: removed {removed} expired entries")
+        save_variant_cache()
+
+
 load_variant_cache()
+
+
+# =====================================================================
+# BACKGROUND CLEANUP THREAD
+# =====================================================================
+_cleanup_stop = threading.Event()
+
+
+def _cleanup_worker():
+    logger.info(f"cleanup worker started (every {CLEANUP_INTERVAL}s)")
+    while not _cleanup_stop.is_set():
+        try:
+            purge_expired_cache()
+            cleanup_old_logs()
+        except Exception as e:
+            logger.warning(f"cleanup worker error: {e}")
+        _cleanup_stop.wait(CLEANUP_INTERVAL)
+
+
+_cleanup_thread = threading.Thread(target=_cleanup_worker, name="cleanup", daemon=True)
+_cleanup_thread.start()
 
 
 # =====================================================================
@@ -407,6 +494,30 @@ async def post_with_retry(session, url, data=None, json=None, headers=None,
 
 
 # =====================================================================
+# SESSION WARM-UP
+# =====================================================================
+async def warm_session(session, domain, proxy=None):
+    """Hit homepage + cart page first so cookies/CSRF are set."""
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Upgrade-Insecure-Requests": "1",
+        }
+        for path in ("/", "/cart", "/products"):
+            try:
+                async with session.get(f"{domain}{path}", headers=headers,
+                                       proxy=proxy, timeout=8, allow_redirects=True) as r:
+                    await r.read()
+            except Exception:
+                continue
+        logger.debug("session warmed")
+    except Exception as e:
+        logger.debug(f"warm_session failed: {e}")
+
+
+# =====================================================================
 # PRODUCT FETCH
 # =====================================================================
 async def fetch_products(domain, proxy_str=None, force_refresh=False):
@@ -430,90 +541,133 @@ async def fetch_products(domain, proxy_str=None, force_refresh=False):
     timeout = aiohttp.ClientTimeout(total=30)
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/146.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "en-US,en;q=0.9",
         "Referer": domain + "/",
+        "X-Requested-With": "XMLHttpRequest",
     }
 
-    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-        all_variants = []
-        page = 1
-        limit = 250
-        max_products = 1000
-        fetched = 0
+    variants_found = []
 
+    def _extract_from_products(products):
+        out = []
+        for p in products:
+            handle = p.get("handle", "product")
+            for v in p.get("variants", []):
+                if not v.get("available", True):
+                    continue
+                try:
+                    price = float(str(v.get("price", "0")).replace(",", ""))
+                    vid = str(v.get("id", ""))
+                    if vid and price > 0:
+                        out.append({
+                            "id": vid, "price": price, "handle": handle,
+                            "title": p.get("title", ""),
+                            "requires_shipping": v.get("requires_shipping", True),
+                        })
+                except (ValueError, TypeError):
+                    continue
+        return out
+
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+        # ---- Strategy 0: warm up session ----
+        await warm_session(session, domain, proxy_url)
+
+        # ---- Strategy 1: /products.json paginated ----
         try:
+            page, limit, max_products, fetched = 1, 250, 1000, 0
             while fetched < max_products:
                 url = f"{domain}/products.json?limit={limit}&page={page}"
-                async with session.get(url, headers=headers, proxy=proxy_url, timeout=8) as resp:
+                async with session.get(url, headers=headers, proxy=proxy_url, timeout=10) as resp:
                     if resp.status != 200:
                         break
-                    data = await resp.json()
-                    products = data.get("products", [])
+                    ct = resp.headers.get("Content-Type", "")
+                    if "json" not in ct.lower():
+                        break
+                    try:
+                        data = await resp.json(content_type=None)
+                    except Exception:
+                        break
+                    products = data.get("products", []) if isinstance(data, dict) else []
                     if not products:
                         break
-                    for p in products:
-                        for v in p.get("variants", []):
-                            if v.get("available", True):
-                                try:
-                                    price = float(v.get("price", "0").replace(",", ""))
-                                    vid = str(v.get("id", ""))
-                                    if vid and price > 0:
-                                        all_variants.append({
-                                            "id": vid, "price": price,
-                                            "handle": p.get("handle", "product"),
-                                            "title": p.get("title", ""),
-                                            "requires_shipping": v.get("requires_shipping", True),
-                                        })
-                                except (ValueError, TypeError):
-                                    continue
+                    variants_found.extend(_extract_from_products(products))
                     fetched += len(products)
                     if len(products) < limit:
                         break
                     page += 1
                     await asyncio.sleep(0.1)
-
-            if all_variants:
-                all_variants.sort(key=lambda x: x["price"])
-                s = all_variants[0]
-                logger.info(f"REST selected handle={s['handle']} id={s['id']} price={s['price']}")
-                set_cached_variant(domain, s["id"], str(s["price"]), s["requires_shipping"], s["handle"])
-                return {
-                    "site": domain, "price": f"{s['price']:.2f}",
-                    "variant_id": s["id"],
-                    "link": f"{domain}/products/{s['handle']}",
-                    "requires_shipping": s["requires_shipping"],
-                    "handle": s["handle"],
-                }, None
         except Exception as e:
-            logger.debug(f"REST paginated fetch failed: {e}")
+            logger.debug(f"products.json failed: {e}")
 
-        try:
-            query = """
-            query Products($first:Int!) {
-                products(first:$first) {
-                    edges { node { id title handle variants(first:50) {
-                        edges { node { id priceV2 { amount currencyCode } availableForSale requiresShipping } }
-                    } } }
+        # ---- Strategy 2: /collections/all/products.json ----
+        if not variants_found:
+            try:
+                url = f"{domain}/collections/all/products.json?limit=250"
+                async with session.get(url, headers=headers, proxy=proxy_url, timeout=10) as resp:
+                    if resp.status == 200 and "json" in resp.headers.get("Content-Type", "").lower():
+                        data = await resp.json(content_type=None)
+                        products = data.get("products", []) if isinstance(data, dict) else []
+                        variants_found.extend(_extract_from_products(products))
+            except Exception as e:
+                logger.debug(f"collections/all failed: {e}")
+
+        # ---- Strategy 3: sitemap -> product.json ----
+        if not variants_found:
+            try:
+                sitemap_url = f"{domain}/sitemap_products_1.xml"
+                async with session.get(sitemap_url, headers=headers, proxy=proxy_url, timeout=10) as resp:
+                    if resp.status == 200:
+                        xml = await resp.text()
+                        handles = re.findall(r"/products/([a-zA-Z0-9\-_]+)", xml)
+                        seen = set()
+                        for h in handles[:15]:
+                            if h in seen:
+                                continue
+                            seen.add(h)
+                            try:
+                                u = f"{domain}/products/{h}.json"
+                                async with session.get(u, headers=headers, proxy=proxy_url, timeout=8) as r2:
+                                    if r2.status != 200:
+                                        continue
+                                    d2 = await r2.json(content_type=None)
+                                    prod = d2.get("product") if isinstance(d2, dict) else None
+                                    if prod:
+                                        variants_found.extend(_extract_from_products([prod]))
+                                        if variants_found:
+                                            break
+                            except Exception:
+                                continue
+            except Exception as e:
+                logger.debug(f"sitemap failed: {e}")
+
+        # ---- Strategy 4: GraphQL ----
+        if not variants_found:
+            try:
+                query = """
+                query Products($first:Int!) {
+                    products(first:$first) {
+                        edges { node { id title handle variants(first:50) {
+                            edges { node { id priceV2 { amount currencyCode } availableForSale requiresShipping } }
+                        } } }
+                    }
                 }
-            }
-            """
-            payload = {"query": query, "variables": {"first": 50}}
-            async with session.post(
-                f"{domain}/api/2024-01/graphql.json",
-                json=payload,
-                headers={"Content-Type": "application/json", **headers},
-                proxy=proxy_url, timeout=8,
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if "errors" not in data:
-                        edges = data.get("data", {}).get("products", {}).get("edges", [])
-                        if edges:
-                            variants = []
+                """
+                payload = {"query": query, "variables": {"first": 50}}
+                async with session.post(
+                    f"{domain}/api/2024-01/graphql.json",
+                    json=payload,
+                    headers={"Content-Type": "application/json", **headers},
+                    proxy=proxy_url, timeout=10,
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json(content_type=None)
+                        if isinstance(data, dict) and "errors" not in data:
+                            edges = data.get("data", {}).get("products", {}).get("edges", [])
                             for edge in edges:
                                 node = edge.get("node", {})
+                                handle = node.get("handle", "product")
                                 for ve in node.get("variants", {}).get("edges", []):
                                     vn = ve.get("node", {})
                                     if vn.get("availableForSale", True):
@@ -521,27 +675,28 @@ async def fetch_products(domain, proxy_str=None, force_refresh=False):
                                             price = float(vn.get("priceV2", {}).get("amount", "0"))
                                             vid = str(vn.get("id", "").split("/")[-1])
                                             if vid and price > 0:
-                                                variants.append({
+                                                variants_found.append({
                                                     "id": vid, "price": price,
-                                                    "handle": node.get("handle", "product"),
+                                                    "handle": handle,
                                                     "requires_shipping": vn.get("requiresShipping", True),
                                                 })
                                         except (ValueError, TypeError):
                                             continue
-                            if variants:
-                                variants.sort(key=lambda x: x["price"])
-                                s = variants[0]
-                                logger.info(f"GraphQL selected handle={s['handle']} id={s['id']} price={s['price']}")
-                                set_cached_variant(domain, s["id"], str(s["price"]), s["requires_shipping"], s["handle"])
-                                return {
-                                    "site": domain, "price": f"{s['price']:.2f}",
-                                    "variant_id": s["id"],
-                                    "link": f"{domain}/products/{s['handle']}",
-                                    "requires_shipping": s["requires_shipping"],
-                                    "handle": s["handle"],
-                                }, None
-        except Exception as e:
-            logger.debug(f"GraphQL fetch failed: {e}")
+            except Exception as e:
+                logger.debug(f"GraphQL fetch failed: {e}")
+
+    if variants_found:
+        variants_found.sort(key=lambda x: x["price"])
+        s = variants_found[0]
+        logger.info(f"selected handle={s['handle']} id={s['id']} price={s['price']}")
+        set_cached_variant(domain, s["id"], str(s["price"]), s["requires_shipping"], s["handle"])
+        return {
+            "site": domain, "price": f"{s['price']:.2f}",
+            "variant_id": s["id"],
+            "link": f"{domain}/products/{s['handle']}",
+            "requires_shipping": s["requires_shipping"],
+            "handle": s["handle"],
+        }, None
 
     return False, "No products found"
 
@@ -554,36 +709,79 @@ async def add_to_cart_async(session, domain, variant_id, proxy=None):
     if not domain.startswith("http"):
         domain = "https://" + domain
 
+    await warm_session(session, domain, proxy)
+
     base_headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/146.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
         "Accept-Language": "en-US,en;q=0.9",
         "Origin": domain,
-        "Referer": domain + "/products",
+        "Referer": f"{domain}/products",
+        "X-Requested-With": "XMLHttpRequest",
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
     }
 
-    url = f"{domain}/cart/add.js"
+    strategies = [
+        {
+            "url": f"{domain}/cart/add.js",
+            "data": f"id={variant_id}&quantity=1&form_type=product",
+            "headers": {**base_headers, "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"},
+        },
+        {
+            "url": f"{domain}/cart/add.js",
+            "json": {"items": [{"id": int(variant_id), "quantity": 1}]},
+            "headers": {**base_headers, "Content-Type": "application/json"},
+        },
+        {
+            "url": f"{domain}/cart/add",
+            "data": f"id={variant_id}&quantity=1",
+            "headers": {**base_headers, "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                        "Accept": "text/html,*/*;q=0.8"},
+        },
+        {
+            "url": f"{domain}/cart/add.js",
+            "json": {"items": [{"id": str(variant_id), "quantity": 1}]},
+            "headers": {**base_headers, "Content-Type": "application/json"},
+        },
+    ]
 
-    headers = {**base_headers, "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"}
-    try:
-        resp = await post_with_retry(session, url, data=f"id={variant_id}&quantity=1",
-                                     headers=headers, proxy=proxy, max_retries=1, backoff=0.5)
-        if resp and resp.status in (200, 201):
-            logger.info("cart add ok (form)")
-            return resp
-    except Exception as e:
-        logger.warning(f"cart form exception: {e}")
+    for i, strat in enumerate(strategies):
+        try:
+            async with session.post(
+                strat["url"],
+                data=strat.get("data"),
+                json=strat.get("json"),
+                headers=strat["headers"],
+                proxy=proxy,
+                timeout=10,
+                allow_redirects=True,
+            ) as resp:
+                body = await resp.text()
+                if resp.status in (200, 201):
+                    logger.info(f"cart add ok (strategy {i+1}, status {resp.status})")
+                    return resp
+                if resp.status in (301, 302, 303) and "/cart" in str(resp.url):
+                    logger.info(f"cart add ok (redirect, strategy {i+1})")
+                    return resp
+                if resp.status == 422 and ("already" in body.lower() or "in your cart" in body.lower()):
+                    logger.info(f"cart add ok (422 already-in-cart, strategy {i+1})")
+                    return resp
+                logger.warning(f"cart strategy {i+1} status={resp.status} body[:120]={body[:120]!r}")
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logger.warning(f"cart strategy {i+1} exception: {e}")
+            continue
 
-    headers = {**base_headers, "Content-Type": "application/json"}
     try:
-        resp = await post_with_retry(session, url,
-                                     json={"items": [{"id": int(variant_id), "quantity": 1}]},
-                                     headers=headers, proxy=proxy, max_retries=1, backoff=0.5)
-        if resp and resp.status in (200, 201):
-            logger.info("cart add ok (json)")
-            return resp
-    except Exception as e:
-        logger.warning(f"cart json exception: {e}")
+        async with session.get(f"{domain}/cart.js", headers=base_headers, proxy=proxy, timeout=8) as r:
+            if r.status == 200:
+                data = await r.json(content_type=None)
+                if isinstance(data, dict) and data.get("item_count", 0) > 0:
+                    logger.info("cart add ok (verified via /cart.js)")
+                    return r
+    except Exception:
+        pass
 
     logger.error("cart add failed on all methods")
     return None
@@ -652,14 +850,12 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             ourl = primary_domain
 
         if not variant_id:
-            info = None
-            err = None
+            info, err = None, None
             for fetch_attempt in range(FETCH_RETRIES):
                 force = fetch_attempt > 0
                 info, err = await fetch_products(ourl, proxy_str, force_refresh=force)
                 if info is not False and info is not None:
                     break
-                # try www variant
                 if not ourl.startswith("https://www."):
                     www = ourl.replace("https://", "https://www.")
                     info, err = await fetch_products(www, proxy_str, force_refresh=True)
@@ -667,11 +863,9 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         ourl = www
                         break
                 if fetch_attempt < FETCH_RETRIES - 1:
-                    logger.warning(
-                        f"Product fetch attempt {fetch_attempt + 1}/{FETCH_RETRIES} "
-                        f"failed ({err}), retrying..."
-                    )
-                    await asyncio.sleep(RETRY_BACKOFF * (2 ** fetch_attempt) + random.uniform(0, 0.5))
+                    wait = RETRY_BACKOFF * (2 ** fetch_attempt) + random.uniform(0, 0.8)
+                    logger.warning(f"fetch attempt {fetch_attempt+1}/{FETCH_RETRIES} failed ({err}) — wait {wait:.1f}s")
+                    await asyncio.sleep(wait)
             if info is False or info is None:
                 return False, err or "Product fetch failed", gateway, total_price, currency, proxy_ok
             variant_id = info["variant_id"]
@@ -684,16 +878,14 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             cart_resp = None
             for cart_attempt in range(CART_RETRIES):
                 cart_resp = await add_to_cart_async(session, ourl, variant_id, proxy_url)
-                if cart_resp and cart_resp.status in (200, 201):
+                if cart_resp and cart_resp.status in (200, 201, 302):
                     break
                 if cart_attempt < CART_RETRIES - 1:
                     status = cart_resp.status if cart_resp else "NO_RESPONSE"
-                    logger.warning(
-                        f"Cart add attempt {cart_attempt + 1}/{CART_RETRIES} "
-                        f"failed ({status}), retrying..."
-                    )
-                    await asyncio.sleep(RETRY_BACKOFF * (2 ** cart_attempt) + random.uniform(0, 0.5))
-            if not cart_resp or cart_resp.status not in (200, 201):
+                    wait = RETRY_BACKOFF * (2 ** cart_attempt) + random.uniform(0, 0.5)
+                    logger.warning(f"cart attempt {cart_attempt+1}/{CART_RETRIES} failed ({status}) — wait {wait:.1f}s")
+                    await asyncio.sleep(wait)
+            if not cart_resp or cart_resp.status not in (200, 201, 302):
                 status = cart_resp.status if cart_resp else "NO_RESPONSE"
                 return False, f"Cart failed with status {status}", gateway, total_price, currency, proxy_ok
 
@@ -1559,12 +1751,31 @@ def shopify_checker():
 def health():
     with _metrics_lock:
         active = _active_checkouts
+    with _cache_lock:
+        cache_size = len(_variant_cache)
     return pretty_jsonify({
         "status": "ok",
         "active_checkouts": active,
         "socks": HAS_SOCKS,
-        "cached_sites": len(_variant_cache),
+        "cached_sites": cache_size,
+        "cache_cap": VARIANT_CACHE_MAX,
+        "cache_ttl": VARIANT_CACHE_TTL,
+        "cleanup_interval": CLEANUP_INTERVAL,
         "time": time.time(),
+    })
+
+
+@app.route("/cleanup", methods=["POST", "GET"])
+def force_cleanup():
+    """Manually trigger cleanup of cache + old logs."""
+    purge_expired_cache()
+    cleanup_old_logs()
+    with _cache_lock:
+        cache_size = len(_variant_cache)
+    return pretty_jsonify({
+        "status": "ok",
+        "cached_sites": cache_size,
+        "message": "cleanup done",
     })
 
 
@@ -1572,18 +1783,23 @@ def health():
 def index():
     with _metrics_lock:
         active = _active_checkouts
+    with _cache_lock:
+        cache_size = len(_variant_cache)
     return pretty_jsonify({
         "name": "Shopify Checker API (reference-style, modern)",
         "endpoint": "/shopify?site=URL&cc=CC|MM|YYYY|CVV&proxy=PROXY",
         "active_checkouts": active,
+        "cached_sites": cache_size,
         "features": [
-            "GraphQL-first product fetch with REST pagination",
+            "GraphQL-first product fetch with REST pagination + sitemap fallback",
+            "Session warm-up before cart add",
             "Persisted GraphQL endpoint support",
             "CheckpointData propagation",
             "Dynamic poll delays from pollDelay",
             "PCI vault fallback strategies (5 attempts)",
             "requiresShipping detection",
-            "Variant cache with TTL",
+            "Variant cache with TTL + LRU eviction",
+            "Auto cleanup of cache + old logs (background thread)",
             "Primary domain resolution",
             "Multi-scheme proxy support (http/https/socks4/socks5)",
             "Request IDs + rotating logs + JSON logging option",
