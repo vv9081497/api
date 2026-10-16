@@ -1,7 +1,4 @@
-fastapi
-uvicorn
+flask[async]
 aiohttp
-flask
-gunicorn
-curl_cffi
-requests
+aiohttp-socks
+gunicorn==21.2.0
