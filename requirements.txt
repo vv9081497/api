@@ -2,3 +2,6 @@ flask[async]
 aiohttp
 aiohttp-socks
 gunicorn==21.2.0
+fastapi
+uvicorn[standard]
+curl_cffi
