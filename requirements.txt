@@ -6,3 +6,4 @@ fastapi
 uvicorn[standard]
 curl_cffi
 flask_cors
+requests
