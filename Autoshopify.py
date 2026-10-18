@@ -24,8 +24,8 @@ CORS(app)
 # STRIPE KEYS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-SECRET_KEY = "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"
-PUBLISHABLE_KEY = "pk_live_mml7hIGddV0ggi8yNy6WIyGT00BY9fU39e"
+SECRET_KEY = "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"
+PUBLISHABLE_KEY = "pk_live_51SpEJXHjd1o0CNQMYd7W330binPIphhKadi1DsiwUdpeJphU9n9icPpQ222pF7qSfgqNGvV1SWlcvelif7DYlZIh00OOM0hif4"
 CURRENCY = "usd"
 AMOUNT = 100  # $1.00 in cents
 
